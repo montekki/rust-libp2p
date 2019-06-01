@@ -20,7 +20,7 @@
 
 #![cfg(test)]
 
-use crate::{GetValueResult, Kademlia, KademliaOut, kbucket::{self, Distance}};
+use crate::{GetValueResult, Kademlia, KademliaOut, RecordStore, kbucket::{self, Distance}};
 use futures::{future, prelude::*};
 use libp2p_core::{
     PeerId,
@@ -272,24 +272,29 @@ fn put_value() {
     let swarm_ids: Vec<_> = swarms.iter()
         .map(|swarm| Swarm::local_peer_id(&swarm).clone()).collect();
 
-    // Test routing configuration:
-    // swarms[31] is connected to swarms[30]
-    // swarms[30] is connected to swarms[..29]
+    // Build the topology, therby avoiding bucket overflow:
+    //
+    // [0   ..   9] <- 10
+    // [10  ..  19] <- 20
+    // [20  ..  29] <- 30
+    // [10, 20, 30] <- 31 (the publisher of the record)
 
-    // Remove two last swarms temoporarily to make borrow checker happy
-    let mut swarm_1 = swarms.pop().unwrap();
-    let mut swarm_2 = swarms.pop().unwrap();
-
-    // Connect swarms[30] to each swarm in swarms[..29]
-    for (i, (_, peer)) in &mut swarms.iter_mut().zip(swarm_ids.clone()).enumerate() {
-        swarm_2.add_address(&peer, Protocol::Memory(port_base + i as u64).into());
+    // Connect swarms[10] to [0..9]
+    for (i, peer) in &mut swarm_ids.iter().take(10).enumerate() {
+        swarms[10].add_address(&peer, Protocol::Memory(port_base + i as u64).into());
     }
-
-    // Connect swarms[31] to swarms[30]
-    swarm_1.add_address(&swarm_ids[30], Protocol::Memory(port_base + 30 as u64).into());
-
-    swarms.push(swarm_2);
-    swarms.push(swarm_1);
+    // Connect swarms[20] to [10..19]
+    for (i, peer) in &mut swarm_ids.iter().enumerate().skip(10).take(10) {
+        swarms[20].add_address(&peer, Protocol::Memory(port_base + i as u64).into());
+    }
+    // Connect swarms[30] to [20..29]
+    for (i, peer) in &mut swarm_ids.iter().enumerate().skip(20).take(10) {
+        swarms[30].add_address(&peer, Protocol::Memory(port_base + i as u64).into());
+    }
+    // Connect swarms[31] to 10, 20 and 30, so it gets to know them all.
+    swarms[31].add_address(&swarm_ids[10], Protocol::Memory(port_base + 10 as u64).into());
+    swarms[31].add_address(&swarm_ids[20], Protocol::Memory(port_base + 20 as u64).into());
+    swarms[31].add_address(&swarm_ids[30], Protocol::Memory(port_base + 30 as u64).into());
 
     let target_key = multihash::encode(Hash::SHA2256, &vec![1,2,3]).unwrap();
 
@@ -314,40 +319,31 @@ fn put_value() {
                     Async::Ready((i, e)) => {
                         match e {
                             KademliaOut::PutValueResult{ .. } => {
-                                for swarm in self.swarms.iter_mut().take(31) {
-                                    swarm.get_value(&self.target_key);
-                                }
-                            }
-                            KademliaOut::GetValueResult(res) => {
-                                match res {
-                                    GetValueResult::Found{ .. } => {
-                                        self.have_key.insert(self.swarm_ids[i].clone());
-                                    }
-                                    GetValueResult::NotFound{ .. } => {
-                                        self.have_no_key.insert(self.swarm_ids[i].clone());
-                                    }
-                                }
+                                let (have_key, have_no_key): (Vec<_>, Vec<_>) =
+                                    self.swarms.iter().take(31)
+                                        .partition(|s| s.records.get(&self.target_key).is_some());
 
-                                if self.have_key.len() + self.have_no_key.len() == 31 {
-                                    assert_eq!(self.have_key.len(), kbucket::MAX_NODES_PER_BUCKET + 1);
-                                    assert_eq!(self.have_no_key.len(), 30 - kbucket::MAX_NODES_PER_BUCKET);
-                                    let key = kbucket::Key::from(self.target_key.clone());
-                                    let mut has_distances: Vec<_> = self.have_key.iter()
-                                        .map(|k| kbucket::Key::from(k.clone()))
-                                        .map(|k| key.distance(&k))
-                                        .collect();
+                                assert_eq!(have_key.len(), kbucket::MAX_NODES_PER_BUCKET);
+                                assert_eq!(have_no_key.len(), 31 - kbucket::MAX_NODES_PER_BUCKET);
 
-                                    let mut has_no_distances: Vec<_> = self.have_no_key.iter()
-                                        .map(|k| kbucket::Key::from(k.clone()))
-                                        .map(|k| key.distance(&k))
-                                        .collect();
+                                let target = kbucket::Key::from(self.target_key.clone());
 
-                                    has_distances.sort();
-                                    has_no_distances.sort();
-                                    assert!(has_no_distances.first() >= has_distances.last());
+                                let mut has_distances: Vec<_> = have_key.iter()
+                                    .map(|s| s.kbuckets.local_key().clone())
+                                    .map(|k| target.distance(&k))
+                                    .collect();
 
-                                    return Ok(Async::Ready(()));
-                                }
+                                let mut has_no_distances: Vec<_> = have_no_key.iter()
+                                    .map(|s| s.kbuckets.local_key().clone())
+                                    .map(|k| target.distance(&k))
+                                    .collect();
+
+                                has_distances.sort();
+                                has_no_distances.sort();
+
+                                assert!(has_no_distances.first() >= has_distances.last());
+
+                                return Ok(Async::Ready(()));
                             }
                             _ => ()
                         }
@@ -391,3 +387,9 @@ fn put_value() {
     )
     .unwrap();
 }
+
+#[test]
+fn put_value_many() {
+    for _ in 0 .. 1000 { put_value() }
+}
+
